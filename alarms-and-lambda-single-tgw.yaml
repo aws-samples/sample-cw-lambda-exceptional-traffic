@@ -233,8 +233,8 @@ Resources:
             Resource: !If [MakeSNSTopic,!Ref SNSTopic,!Ref ExistingSNSTopic]
           - !If
             - MakeSNSTopic
-            - Sid: AllowKMSKeyUse,
-              Effect: Allow,
+            - Sid: AllowKMSKeyUse
+              Effect: Allow
               Action:
                 - "kms:GenerateDataKey"
                 - "kms:Decrypt"
