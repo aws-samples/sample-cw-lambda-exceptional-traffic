@@ -1,12 +1,17 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Creates the infrastructure for capturing Transit Gateway Flow Logs on exceptional traffic levels. This version is deployed for Network Manager covering TGWs.
+Description: Creates the infrastructure for capturing Transit Gateway Flow Logs on exceptional traffic levels.
 
 Parameters:
   GlobalNetworkArn:
     Type: String
-    Description: The global network ARN of the network to monitor.
-    AllowedPattern: "arn:[a-z-]+:networkmanager::[0-9]{12}:global-network/global-network-[a-z0-9]{17}"
+    Description: If in NetworkManager mode, the global network ARN of the network to monitor, otherwise leave blank.
+    AllowedPattern: "^$|^arn:[a-z-]+:networkmanager::[0-9]{12}:global-network/global-network-[a-z0-9]{17}$"
     ConstraintDescription: "Must be a global network ARN (arn:aws:networkmanager::accountid:global-network/global-network-0123456789abcdef)"
+  TransitGatewayId:
+    Type: String
+    Description: If in TGW mode, the transit gateway ID to enabling alarming on attachments for, otherwise leave blank.
+    AllowedPattern: "^$|^tgw-[0-9a-f]{17}$"
+    ConstraintDescription: "Must be a valid Transit Gateway ID (e.g., tgw-0123456789abcdef0)"
   StdDev:
     Type: Number
     MinValue: 1
@@ -24,7 +29,7 @@ Parameters:
     Description: How many minutes should the anomalies be occurring for before we alarm and start the capturing?
   ExistingSNSTopic:
     Type: String
-    Description: If you have an existing SNS topic you want notifications sent to, provide the ARN here, otherwise leave blank and provide EmailAddress instead.
+    Description: If you have an existing SNS topic you want notifications sent to, provide the ARN here and ensure the lambda functions have permissions to publish to it, otherwise leave blank and provide EmailAddress instead.
     AllowedPattern: "^$|^arn:[a-z0-9-]+:sns:[a-z0-9-]+:[0-9]{12}:[a-zA-Z0-9_-]+$"
     ConstraintDescription: "Must be a valid SNS topic ARN (e.g., arn:aws:sns:us-east-1:123456789012:MyTopic) or empty"
   EmailAddress:
@@ -41,10 +46,16 @@ Parameters:
     Description: How many days should flow logs be left in the S3 buckets before being auto-deleted?
     MinValue: 1
     Default: 7
+  DaysToRetainLambdaLogs:
+    Type: Number
+    Description: How many days should the Lambda functions retain their event logs in CloudWatch logs?
+    MinValue: 1
+    Default: 7
   ObjectsName:
     Type: String
     Description: A short unique string to add to all names (S3 buckets, Lambda functions, Alarm names) to uniquely identify this deployment. Must meet S3 bucket naming requirements (primarily all lowercase). No more than 16 letters to leave room for other IDs applied. 
     AllowedPattern: "(?!(^xn--|.+-s3alias$))^[a-z0-9][a-z0-9-]{1,16}[a-z0-9]$"
+    Default: usagealarms
 
 Rules:
   ValidateSNSConfiguration:
@@ -59,6 +70,18 @@ Rules:
             - !Not [!Equals [!Ref ExistingSNSTopic, ""]]
             - !Not [!Equals [!Ref EmailAddress, ""]]
         AssertDescription: "You must provide either an ExistingSNSTopic ARN or an EmailAddress, not both."
+  ValidateObjectSelection:
+    Assertions:
+      - Assert: !Not
+          - !And
+            - !Equals [!Ref GlobalNetworkArn, ""]
+            - !Equals [!Ref TransitGatewayId, ""]
+        AssertDescription: "You must provide either a NetworkManager global network ARN, or a single Transit Gateway ID."
+      - Assert: !Not
+          - !And
+            - !Not [!Equals [!Ref GlobalNetworkArn, ""]]
+            - !Not [!Equals [!Ref TransitGatewayId, ""]]
+        AssertDescription: "You must provide either a NetworkManager global network ARN, or a single Transit Gateway ID, not both."
 
 Conditions:
   MakeSNSTopic:
@@ -66,12 +89,16 @@ Conditions:
       - Fn::Equals:
         - !Ref EmailAddress
         - ""
+  ModeNM:
+    Fn::Equals:
+      - !Ref TransitGatewayId
+      - ""
 
 Resources:
   S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Join ['-', [ !Ref ObjectsName, !Ref AWS::Region, !Select [3, !Split ['-', !Ref GlobalNetworkArn]]]]
+      BucketName: !Join ['-', [ !Ref AWS::AccountId, !Ref ObjectsName, !Ref AWS::Region ] ]
       LifecycleConfiguration:
         Rules:
           - Id: !Sub "RemoveAfter${DaysToRetainFlowLogs}Days"
@@ -193,69 +220,24 @@ Resources:
         - Protocol: Email
           Endpoint: !Ref EmailAddress
 
-  EventHandlerIAMPolicy:
+  LambdaCommonPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      Description: !Sub Permissions needed for ${AWS::StackName}-EventHandlerLambda to function
+      Description: !Sub Permissions needed for ${AWS::StackName} lambda functions to send to the SNS topic and perform logging
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: GlobalOperations
-            Effect: Allow
-            Resource: "*"
-            Action:
-              - "networkmanager:GetTransitGatewayRegistrations"
-              - "networkmanager:ListCoreNetworks"
-              - "networkmanager:ListAttachments"
-              - "ec2:DescribeTransitGatewayAttachments"
-          - Sid: AllowCloudwatchAlarmDiscovery
-            Effect: Allow
-            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
-            Action:
-              - "cloudwatch:DescribeAlarms"
-          - Sid: AllowCloudwatchAlarmManipulation
-            Effect: Allow
-            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*-${ObjectsName}-Alarm'
-            Action:
-              - "cloudwatch:DescribeAlarms"
-              - "cloudwatch:DeleteAlarms"
-              - "cloudwatch:PutMetricAlarm"
-              - "cloudwatch:SetAlarmState"
-              - "cloudwatch:TagResource"
-          - Sid: S3Buckets
-            Effect: Allow
-            Resource: !Sub 'arn:${AWS::Partition}:s3:::${ObjectsName}-*'
-            Action:
-              - "s3:CreateBucket"
-              - "s3:DeleteBucket"
-          - Sid: S3Objects
-            Effect: Allow
-            Action:
-              - "s3:DeleteObject"
-              - "s3:GetBucketPolicy"
-              - "s3:PutBucketPolicy"
-              - "s3:ListBucket"
-            Resource:
-              - !Sub 'arn:${AWS::Partition}:s3:::${ObjectsName}-*'
-              - !Sub 'arn:${AWS::Partition}:s3:::${ObjectsName}-*/*'
-          - Sid: AllowManagingAlarmLambdas
-            Effect: Allow
-            Action:
-              - "lambda:CreateFunction"
-              - "lambda:DeleteFunction"
-              - "lambda:GetFunction"
-            Resource:
-              - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:${ObjectsName}_Alarm_Handler'
-          - Sid: AllowPassingRoleToLambdasInOtherRegions
-            Effect: Allow
-            Action:
-              - "iam:PassRole"
-            Resource: !GetAtt AlarmRole.Arn
           - Sid: AllowSNSPublish
             Effect: Allow
             Action:
               - "sns:Publish"
             Resource: !If [MakeSNSTopic,!Ref SNSTopic,!Ref ExistingSNSTopic]
+          - Sid: AllowLogging
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt SharedLambdaLogGroup.Arn
           - !If
             - MakeSNSTopic
             - Sid: AllowKMSKeyUse
@@ -265,6 +247,89 @@ Resources:
                 - "kms:Decrypt"
               Resource: !GetAtt SNSEncryptionKey.Arn
             - !Ref "AWS::NoValue"
+
+  SharedLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ObjectsName}-shared-logs"
+      RetentionInDays: !Ref DaysToRetainLambdaLogs
+
+  EventHandlerModeNMPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: ModeNM
+    Properties:
+      Description: !Sub Permissions needed for ${AWS::StackName}-EventHandlerLambda to function in NetworkManager mode and do cross-region deployment management
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: NetworkManagerOperations
+            Effect: Allow
+            Resource: "*"
+            Action:
+              - "networkmanager:GetTransitGatewayRegistrations"
+              - "networkmanager:ListCoreNetworks"
+              - "networkmanager:ListAttachments"
+          - Sid: AllowCrossRegionS3BucketManagement
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${AWS::AccountId}-${ObjectsName}-*'
+            Action:
+              - "s3:CreateBucket"
+              - "s3:DeleteBucket"
+              - "s3:GetBucketPolicy"
+              - "s3:PutBucketPolicy"
+          - Sid: AllowCrossRegionLambdaManagement
+            Effect: Allow
+            Action:
+              - "lambda:CreateFunction"
+              - "lambda:DeleteFunction"
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:${ObjectsName}_Alarm_Handler'
+          - Sid: AllowPassingRoleToLambdasInOtherRegions
+            Effect: Allow
+            Action:
+              - "iam:PassRole"
+            Resource: !GetAtt AlarmRole.Arn
+
+  EventHandlerIAMPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: !Sub Permissions needed for ${AWS::StackName}-EventHandlerLambda to function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBucketAccess
+            Effect: Allow
+            Action:
+              - "s3:DeleteObject"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${AWS::AccountId}-${ObjectsName}-*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${AWS::AccountId}-${ObjectsName}-*/*'
+          - Sid: AllowTGWDescribe
+            Effect: Allow
+            Resource: "*"
+            Action:
+              - "ec2:DescribeTransitGatewayAttachments"
+          - Sid: AllowCloudwatchAlarmDiscovery
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+            Action:
+              - "cloudwatch:DescribeAlarms"
+          - Sid: AllowFindingFunction
+            Effect: Allow
+            Action:
+              - "lambda:GetFunction"
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:${ObjectsName}_Alarm_Handler'
+          - Sid: AllowCloudwatchAlarmManipulation
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*-${ObjectsName}-Alarm'
+            Action:
+              - "cloudwatch:DescribeAlarms"
+              - "cloudwatch:DeleteAlarms"
+              - "cloudwatch:PutMetricAlarm"
+              - "cloudwatch:SetAlarmState"
+              - "cloudwatch:TagResource"
 
   EventHandlerRole:
     Type: AWS::IAM::Role
@@ -279,7 +344,9 @@ Resources:
       Path: "/"
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Ref LambdaCommonPolicy
         - !Ref EventHandlerIAMPolicy
+        - !If [ModeNM, !Ref EventHandlerModeNMPolicy, !Ref "AWS::NoValue"]
 
   EventHandlerLambda:
     Type: AWS::Lambda::Function
@@ -290,6 +357,8 @@ Resources:
     Properties:
       DeadLetterConfig:
         TargetArn: !If [MakeSNSTopic, !Ref SNSTopic, !Ref ExistingSNSTopic]
+      LoggingConfig:
+        LogGroup: !Ref SharedLambdaLogGroup
       Handler: index.handler
       Role: !GetAtt EventHandlerRole.Arn
       Runtime: python3.12
@@ -298,8 +367,7 @@ Resources:
       FunctionName: !Sub "${ObjectsName}_Event_Handler"
       Environment:
         Variables:
-          STACK_ARN: !Ref AWS::StackId          
-          GLOBAL_NETWORK_ARN: !Ref GlobalNetworkArn
+          STACK_ARN: !Ref AWS::StackId
           METRIC_NAMES: !Ref MetricNamesToAlarm
           STDDEV: !Ref StdDev
           MINUTES: !Ref MinutesBeforeStarting
@@ -307,19 +375,21 @@ Resources:
           SNS_TOPIC: !If [MakeSNSTopic,!Ref SNSTopic,!Ref ExistingSNSTopic]
           OBJECTS_NAME: !Ref ObjectsName
           ALARM_LAMBDA_ROLE: !GetAtt AlarmRole.Arn
+          MODE: !If [ModeNM, "nm", "tgw"]
+          GLOBAL_NETWORK_ARN: !Ref GlobalNetworkArn
+          TGW_ID: !Ref TransitGatewayId
       Code:
         ZipFile: |
           """
           Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
           SPDX-License-Identifier: MIT-0
-
-          nm_event_handler.py
-
+          
+          event_handler.py
+          
           Python lambda script to handle CloudFormation and EventBridge events for changes. This script relies on environment variables to pass in how
           things should be configured. These are normally set by the CloudFormation template wrapping this script. Those variables are:
-
+          
           STACK_ARN - The CloudFormation stack ARN used for this deployment
-          GLOBAL_NETWORK_ARN - The global network ARN (arn:aws:networkmanager::accountid:global-network/global-network-0123456789abcdef) of the network to monitor.
           METRIC_NAMES - Comma-separated list of metrics to alarm on. ex: "BytesIn,BytesOut"
           STDDEV - By how many standard deviations should the anomaly detection threshold be set to, ex: "2"
           MINUTES - How many minutes should the anomalies be occurring for before we alarm and start the capturing?, ex: "2"
@@ -328,7 +398,14 @@ Resources:
           SNS_TOPIC - The SNS topic ARN to send notifications to
           OBJECTS_NAME - A short unique string to add to all names (S3 buckets, Lambda functions, Alarm names) to uniquely identify this deployment.
           ALARM_LAMBDA_ROLE - The IAM Role ARN to be used for the alarm-handling lambda functions
-
+          TYPE - Set to 'nm' if we are using network manager, 'tgw' if a single TGW
+          
+          If TYPE='nm':
+          GLOBAL_NETWORK_ARN - The global network ARN (arn:aws:networkmanager::accountid:global-network/global-network-0123456789abcdef) of the network to monitor.
+          
+          If TYPE='tgw':
+          TGW_ID - The Transit Gateway ID to monitor
+          
           Additionally, it leverages some variables set by AWS Lambda itself - AWS_LAMBDA_FUNCTION_NAME and AWS_REGION.
           """
           import boto3
@@ -342,47 +419,55 @@ Resources:
           import re
           import urllib.request
           from typing import Dict, List, Set, Any, Optional
-
+          
           # 'tgw' or 'cwan' -> regions -> TGW or core network ID -> attachment ID -> dict of data (type:attachment Type, alarms if find_alarms has been called)
           type AttachmentData = dict[str, dict[str, dict[str, dict[str, dict[str, Any]]]]]
-
+          CONTEXT_ACCOUNT_ID:str = ""    # Account ID this lambda is running under, determined by the initial context provided to the handler.
+          logger = logging.getLogger()
+          
           def timeout(event, context):
               """
               If we run over the lambda invocation time limit, this function is called. If we're called from CloudFormation, it sends the failed status back 
               to keep CloudFormation from waiting longer.
               """
               if 'ResponseURL' in event:
-                  logging.error('Execution is about to time out, sending failure response to CloudFormation')
+                  logger.error('Execution is about to time out, sending failure response to CloudFormation')
                   cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
               exit(1)
-
-
+          
+          
           def find_attachments() -> AttachmentData:
               """
-              Find all TGW and CloudWAN attachments in this global network. This function can be relatively slow if a lot of TGW regions are in use. It filters
-              to only attachments that are available (fully working). Transit Gateway peering connections are also ignored (we will catch the traffic coming into 
+              Find all CloudWAN attachments in the global network. This function can be relatively slow if a lot of regions are in use. It filters
+              to only attachments that are available (fully working). Transit Gateway peering connections are also ignored (we will catch the traffic coming into
               transit gateway via whatever downstream connection).
-
+          
               :return AttachmentData: Filled in AttachmentData, see description of type.
               """
-              ret:AttachmentData = {"tgw": {}, "cwan": {}}
-
-              # Find all Transit Gateway attachments. This requires cross-region calls, so batch together all TGWs in a region, then do one call per region.
-              nm = boto3.client('networkmanager')
-              tgws_by_region:dict[str, list[str]] = {}
-              global_network_id = os.environ['GLOBAL_NETWORK_ARN'].split('/')[1]
-              for tgw in nm.get_transit_gateway_registrations(GlobalNetworkId=global_network_id)['TransitGatewayRegistrations']:
-                  if 'TransitGatewayArn' in tgw:
-                      tgw_region = tgw['TransitGatewayArn'].split(':')[3]
-                      if tgw_region not in tgws_by_region:
-                          tgws_by_region[tgw_region] = []
-                      tgws_by_region[tgw_region].append(tgw['TransitGatewayArn'].split(':')[5].split('/')[1])
-              
+              ret: AttachmentData = {"tgw": {}, "cwan": {}}
+          
+              # Find all Transit Gateway attachments. In NetworkManager mode, this requires cross-region calls, so batch together all TGWs in a region, then do one call per region.
+              if os.environ['MODE'] == 'nm':
+                  tgws_by_region: dict[str, list[str]] = {}
+                  global_network_id = os.environ['GLOBAL_NETWORK_ARN'].split('/')[1]
+                  nm = boto3.client('networkmanager')
+                  for tgw in nm.get_transit_gateway_registrations(GlobalNetworkId=global_network_id)['TransitGatewayRegistrations']:
+                      if 'TransitGatewayArn' in tgw:
+                          tgw_region = tgw['TransitGatewayArn'].split(':')[3]
+                          if tgw_region not in tgws_by_region:
+                              tgws_by_region[tgw_region] = []
+                          tgws_by_region[tgw_region].append(tgw['TransitGatewayArn'].split(':')[5].split('/')[1])
+              else:
+                  tgws_by_region = {os.environ['AWS_REGION']: [os.environ['TGW_ID']]}
+          
+              logger.debug(f'find_attachments() - discovered TGWs {tgws_by_region}')
+          
               for region, tgw_list in tgws_by_region.items():
                   ec2 = boto3.client('ec2', region_name=region)
                   paginator = ec2.get_paginator('describe_transit_gateway_attachments')
                   resp = paginator.paginate(Filters=[{'Name': 'transit-gateway-id', 'Values': tgw_list}])
                   for page in resp:
+                      logger.debug(f'find_attachments() - region {region}, TGWs {tgw_list}, processing response page {page}')
                       for attachment in page['TransitGatewayAttachments']:
                           if all(k in attachment for k in ['State', 'TransitGatewayId', 'TransitGatewayAttachmentId', 'ResourceType']):
                               if attachment['State'] == 'available' and attachment['ResourceType'] != 'peering':
@@ -391,33 +476,36 @@ Resources:
                                   if attachment['TransitGatewayId'] not in ret['tgw'][region]:
                                       ret['tgw'][region][attachment['TransitGatewayId']] = {}
                                   ret['tgw'][region][attachment['TransitGatewayId']][attachment['TransitGatewayAttachmentId']] = {'type': attachment['ResourceType']}
-
-              # Now find CloudWAN attachments. Find the core networks that are in this global network, then all attachments.
-              global_network_id = os.environ['GLOBAL_NETWORK_ARN'].split('/')[1]
-              for core_network in nm.list_core_networks()['CoreNetworks']:
-                  if 'GlobalNetworkId' in core_network and 'CoreNetworkId' in core_network:
-                      if core_network['GlobalNetworkId'] == global_network_id:
-                          paginator = nm.get_paginator('list_attachments')
-                          resp = paginator.paginate(CoreNetworkId=core_network['CoreNetworkId'])
-                          for page in resp:
-                              for attachment in page['Attachments']:
-                                  if all(k in attachment for k in ['State', 'EdgeLocation', 'AttachmentType']):
-                                      if attachment['State'] == 'AVAILABLE':
-                                          if attachment['EdgeLocation'] not in ret['cwan']:
-                                              ret['cwan'][attachment['EdgeLocation']] = {}
-                                          if core_network['CoreNetworkId'] not in ret['cwan'][attachment['EdgeLocation']]:
-                                              ret['cwan'][attachment['EdgeLocation']][core_network['CoreNetworkId']] = {}
-                                          ret['cwan'][attachment['EdgeLocation']][core_network['CoreNetworkId']][attachment['AttachmentId']] = {'type': attachment['AttachmentType']}
-
+          
+              # If using NetworkManager, find CloudWAN attachments. Find the core networks that are in this global network, then all attachments.
+              if os.environ['MODE'] == 'nm':
+                  global_network_id = os.environ['GLOBAL_NETWORK_ARN'].split('/')[1]
+                  nm = boto3.client('networkmanager')
+                  for core_network in nm.list_core_networks()['CoreNetworks']:
+                      if 'GlobalNetworkId' in core_network and 'CoreNetworkId' in core_network:
+                          if core_network['GlobalNetworkId'] == global_network_id:
+                              paginator = nm.get_paginator('list_attachments')
+                              resp = paginator.paginate(CoreNetworkId=core_network['CoreNetworkId'])
+                              for page in resp:
+                                  for attachment in page['Attachments']:
+                                      if all(k in attachment for k in ['State', 'EdgeLocation', 'AttachmentType']):
+                                          if attachment['State'] == 'AVAILABLE':
+                                              if attachment['EdgeLocation'] not in ret['cwan']:
+                                                  ret['cwan'][attachment['EdgeLocation']] = {}
+                                              if core_network['CoreNetworkId'] not in ret['cwan'][attachment['EdgeLocation']]:
+                                                  ret['cwan'][attachment['EdgeLocation']][core_network['CoreNetworkId']] = {}
+                                              ret['cwan'][attachment['EdgeLocation']][core_network['CoreNetworkId']][attachment['AttachmentId']] = {'type': attachment['AttachmentType']}
+          
+              logger.debug(f'find_attachments() returning {ret}')
               return ret
-
-
+          
+          
           def find_alarms(ad:AttachmentData) -> AttachmentData:
               """
               Augment the given AttachmentData with a third field in AttachmentInfo named 'alarms', type dict, keys the individual fields then a dict with key 'present':boolean 
               if the alarm was found, 'name':str for the alarm name, 'region':str for the CloudWatch region the alarm is in, and key 'settings':dict for the current settings for that alarm.
               Any alarms found that are invalid (due to being incomplete for some reason or pointing to an attachment that no longer exists) are removed from CloudWatch.
-
+          
               :param AttachmentData ad: AttachmentData from find_attachments
               :param List[str] fields: List of Cloudwatch metric fields to look for (i.e. BytesIn, BytesOut)
               
@@ -433,10 +521,11 @@ Resources:
                               attachment_data['alarms'] = {x: {'present': False, 'name': None, 'region': None, 'settings': {}} for x in metric_names}
                               if type == 'cwan':
                                   cwan_regions[attachment_id] = region
-
+          
               region_list = set(ad['cwan'].keys()).union(set(ad['tgw'].keys()))
-              # Ensure we have the CloudWAN region as well.
-              region_list.add(get_cloudwan_cloudwatch_region())
+              if os.environ['MODE'] == 'nm':
+                  # Ensure we have the CloudWAN metric region as well.
+                  region_list.add(get_cloudwan_cloudwatch_region())
               
               for region in region_list:
                   cw = boto3.client('cloudwatch', region_name=region)
@@ -483,28 +572,29 @@ Resources:
                                                   attachment_id = dim['Value']
                                                   set_region = cwan_regions[attachment_id]
                               if type is None or net_id is None or attachment_id is None or metric_name is None or metric_name not in metric_names:
-                                  print(f"Found an alarm {alarm['AlarmName']} from this script, but it does not have the correct metrics set on it (type={type}, net_id={net_id}, attach_id={attachment_id}, metric_name={metric_name}). Removing it.")
+                                  logger.info(f"Found an alarm {alarm['AlarmName']} from this script, but it does not have the correct metrics set on it (type={type}, net_id={net_id}, attach_id={attachment_id}, metric_name={metric_name}). Removing it.")
                                   remove_alarm(region, alarm['AlarmName'])
                               elif type not in ad or set_region not in ad[type] or net_id not in ad[type][set_region] or attachment_id not in ad[type][set_region][net_id]:
-                                  print(f"Found an alarm {alarm['AlarmName']} from this script, but the attachment it points to is gone (type={type}, net_id={net_id}, attach_id={attachment_id}, metric_name={metric_name}). Removing it.")
+                                  logger.info(f"Found an alarm {alarm['AlarmName']} from this script, but the attachment it points to is gone (type={type}, net_id={net_id}, attach_id={attachment_id}, metric_name={metric_name}). Removing it.")
                                   remove_alarm(region, alarm['AlarmName'])
                               else:     
-                                  ad[type][set_region][net_id][attachment_id]['alarms'][metric_name] = {'present': True, 'region': region, 'settings': settings, 'name': alarm['AlarmName']}               
-
+                                  ad[type][set_region][net_id][attachment_id]['alarms'][metric_name] = {'present': True, 'region': region, 'settings': settings, 'name': alarm['AlarmName']}
+          
+              logger.debug(f'find_alarms() returning {ad}')
               return ad
-
-
+          
+          
           def set_alarm(type:str, region:str, net_id:str, attachment_id:str, metric_name:str) -> None:
               """
               Create our standard alarm in Cloudwatch.
-
+          
               :param str type: cwan or tgw
               :param str region: Region name of the resource
               :param str net_id: net_id
               :param str attachment_id: attachment_id
               :param str metric_name: Name of the metric to set the alarm on
               """
-
+          
               # If this is a CloudWAN attachment, we use cloudwan_cloudwatch_region, else we use region. Set the correct dimensions for our metric here as well.
               if type == 'tgw':
                   cw = boto3.client('cloudwatch', region_name=region)
@@ -519,11 +609,11 @@ Resources:
                   metric_stat = {'Metric': {'Namespace': 'AWS/Network Manager', 'MetricName': metric_name,
                                             'Dimensions': [{'Name': 'CoreNetwork', 'Value': net_id}, {'Name': 'Attachment', 'Value': attachment_id}]},
                                             'Period': 60, 'Stat': 'Average'}
-
+          
               # This format is made such that humans can understand the alarm easily in console view, although it makes
               # the scripting a bit harder by not having a consistent prefix.
               alarm_name = f'{metric_name}-{type}-{attachment_id}-{os.environ['OBJECTS_NAME']}-Alarm'
-
+          
               # Create the actual alarm. The metric is in m1, the anomaly band processing is in e1. e2 creates logic that ANDs together the anomaly band being exceeded,
               # and m1 being greater than our minimum_value, and outputs a 1 or 0, and is the value Cloudwatch is looking at. Thus, we set the alarming operator to 
               # greater than 0.
@@ -534,12 +624,12 @@ Resources:
                                           {'Id': 'e1', 'Expression': f'ANOMALY_DETECTION_BAND(m1, {os.environ['STDDEV']})', 'Label': 'Anomaly Band', 'ReturnData': False},
                                           {'Id': 'e2', 'Expression': f'IF(m1>{os.environ['MINIMUM_VALUE']} AND m1>MAX(e1),1,0)', 'Label': 'Alarm Trigger', 'ReturnData': True}],
                                   Threshold=0, ComparisonOperator='GreaterThanThreshold', EvaluationPeriods=int(os.environ['MINUTES']), DatapointsToAlarm=int(os.environ['MINUTES']))
-
-
+          
+          
           def delete_alarm(type:str, region:str, attachment_id:str, metric_name:str) -> None:
               """
               Delete a standard alarm in Cloudwatch.
-
+          
               :param str type: cwan or tgw
               :param str region: Region name of the resource
               :param str attachment_id: attachment_id
@@ -550,29 +640,29 @@ Resources:
               else:
                   cloudwan_cloudwatch_region = get_cloudwan_cloudwatch_region()
                   cw = boto3.client('cloudwatch', region_name=cloudwan_cloudwatch_region)    
-
+          
               alarm_name = f'{metric_name}-{type}-{attachment_id}-{os.environ['OBJECTS_NAME']}-Alarm'
               # Make sure to set the alarm state to OK (which will trigger the OKAction if necessary) before deleting the alarm
               cw.set_alarm_state(AlarmName=alarm_name, StateValue='OK', StateReason="Alarm is being removed.")
               cw.delete_alarms(AlarmNames=[alarm_name])
-
-
+          
+          
           def get_partition_for_region(region_name:str) -> str:
               """
               A quick function to get the partition name for any given region.
-
+          
               :param str region_name: Region name to get.
               :return str: The partition name ('aws', etc.)
               """
               session = boto3.Session()
               return session.get_partition_for_region(region_name)
-
-
+          
+          
           def get_cloudwan_cloudwatch_region() -> str:
               """
               As per https://docs.aws.amazon.com/network-manager/latest/cloudwan/cloudwan-cloudwatch-metrics.html, CloudWAN metrics are only
               available in one region per partition. This returns those values. 
-
+          
               :param str region_name: Region name to find
               :return str: Region name CloudWAN's CloudWatch metrics are in
               """
@@ -584,40 +674,39 @@ Resources:
                   case _:
                       # Could only get here if a partition has been added and this code isn't updated - raise an exception
                       raise Exception(f'Unhandled partition {os.environ['GLOBAL_NETWORK_ARN'].split(':')[1]}. The get_cloudwan_cloudwatch_region function needs updating against the AWS documentation.')
-
-
+          
+          
           def get_alarm_names(region_name:str) -> dict[str, str]:
               """
               Calculate the lambda and S3 names for the alarm function to use for a given region. Returns some additional bits that are
               needed anyway for the calculation
-
+          
               :param str region_name: Region name to get names for
               :return dict[str, str]: Keys of 
                                       'bucket_name' and 'bucket_arn' for the S3 bucket, 
                                       'lambda_name' for the lambda name,
                                       'partition' for the partition of the region
               """
-              gn_uuid = os.environ['GLOBAL_NETWORK_ARN'].split('-')[3]
               ret:dict[str,str] = {}
               ret['partition'] = get_partition_for_region(region_name)
-              ret['bucket_name'] = f'{os.environ['OBJECTS_NAME']}-{region_name}-{gn_uuid}'
+              ret['bucket_name'] = f'{CONTEXT_ACCOUNT_ID}-{os.environ['OBJECTS_NAME']}-{region_name}'
               ret['bucket_arn'] = f'arn:{ret['partition']}:s3:::{ret['bucket_name']}'
               ret['lambda_name'] = f'{os.environ['OBJECTS_NAME']}_Alarm_Handler'
               return ret
-
-
+          
+          
           def get_alarm_lambda_arn(region_name:str, create_missing:bool = True) -> Optional[str]:
               """
               Return the lambda ARN of our alarm lambda for the given region. Creates the lambda, if it's not already present.
-
+          
               :param str region_name: Region name for the lambda
               :param bool create_missing: Create the lambda, if it's not present in the region yet.
               :return str: A full ARN (that may have just been created)
               """
-
+          
               names = get_alarm_names(region_name)
               l = boto3.client('lambda', region_name=region_name)
-
+          
               # See if the function already exists.  If it does, just return its ARN.
               try:
                   resp = l.get_function(FunctionName=names['lambda_name'])
@@ -629,11 +718,11 @@ Resources:
               
               # Build out the new region - this function returns the ARN we need.
               if create_missing:
-                  return new_region_build(dest_region_name=region_name)
+                  return region_build(dest_region_name=region_name)
               else:
                   return None
-
-
+          
+          
           def get_alarm_handler_lambda_code() -> bytes:
               """
               Return the data needed for a ZipFile input of a create_function lambda call, based on a copy of the AlarmLambda function in the local region.
@@ -643,21 +732,20 @@ Resources:
               lambda_data = l.get_function(FunctionName=names['lambda_name'])
               req = urllib.request.urlopen(urllib.request.Request(url=lambda_data['Code']['Location'], method='GET'), timeout=5)
               return req.read()
-
-
-          def new_region_build(dest_region_name:str) -> str:
+          
+          
+          def region_build(dest_region_name:str) -> str:
               """
               Set up a new region for use. This involves creating an S3 bucket and copying the policy from source region, then copying the lambda
               function from the source region.
-
-              :param str source_region_name: The region to copy from.
+          
               :param str dest_region_name: The region to copy to.
-
+          
               :return str: The ARN of the lambda function in the new region.
               """
               source_names = get_alarm_names(os.environ['AWS_REGION'])
               dest_names = get_alarm_names(dest_region_name)
-
+          
               # The lambda requires a regional S3 bucket - create one. Wrapped in a try block because there's a chance this bucket already exists
               # (this code is running multiple times for some reason).
               dest_s3 = boto3.client('s3', region_name=dest_region_name)
@@ -667,13 +755,13 @@ Resources:
                       resp = dest_s3.create_bucket(Bucket=dest_names['bucket_name'], CreateBucketConfiguration={'LocationConstraint': dest_region_name})
                   else:
                       resp = dest_s3.create_bucket(Bucket=dest_names['bucket_name'])
-                  print(f'Expanding to a new region: Created a new bucket {dest_names['bucket_name']} in region {dest_region_name} for logs.')
-
+                  logger.info(f'Expanding to a new region: Created a new bucket {dest_names['bucket_name']} in region {dest_region_name} for logs.')
+          
               except botocore.exceptions.ClientError as e:
                   # If we already have and own the bucket, ignore and move on, otherwise raise exception.
                   if e.response['Error']['Code'] != 'BucketAlreadyOwnedByYou':
                       raise e        
-
+          
               # Copy the bucket policy from source to dest, replacing region names.
               src_s3 = boto3.client('s3')
               src_policy = src_s3.get_bucket_policy(Bucket=source_names['bucket_name'])
@@ -684,25 +772,39 @@ Resources:
               dst_policy = dst_policy.replace(source_names['bucket_arn'], dest_names['bucket_arn'])
               # Apply to destination.
               dest_s3.put_bucket_policy(Bucket=dest_names['bucket_name'], Policy=dst_policy)
-              print(f'Copied bucket policy from {source_names['bucket_name']} to {dest_names['bucket_name']}')
-
+              logger.info(f'Copied bucket policy from {source_names['bucket_name']} to {dest_names['bucket_name']}')
+          
               # Copy bucket lifecycle configuration
               try:
                   resp = src_s3.get_bucket_lifecycle_configuration(Bucket=source_names['bucket_name'])    
                   dest_s3.put_bucket_lifecycle_configuration(Bucket=dest_names['bucket_name'], LifecycleConfiguration={'Rules': resp['Rules']})
-                  print(f'Copied bucket lifecycle configuration from {source_names['bucket_name']} to {dest_names['bucket_name']}')
+                  logger.info(f'Copied bucket lifecycle configuration from {source_names['bucket_name']} to {dest_names['bucket_name']}')
               except botocore.exceptions.ClientError as e:
                   # Someone maybe deleted the lifecycle configuration we made on the original bucket? If so, just ignore it and move on.
                   if e.response['Error']['Code'] != 'NoSuchLifecycleConfiguration':
                       raise e
-
+          
+              # Create log group in destination
+              lgn = f'/aws/lambda/{dest_names['objects_name']}-shared-logs'
+              dest_logs = boto3.client('logs', region_name=dest_region_name)
+              dest_logs.create_log_group(logGroupName=lgn)
+              # Copy log group configuration
+          
+              try:
+                  src_logs = boto3.client('logs')
+                  lg = src_logs.get_log_group(lgn)
+                  dest_logs.put_retention_policy(logGroupName=lgn, retentionInDays=lg.get('retentionInDays'))
+              except Exception as e:
+                  logger.info(f'Had an exception {e} trying to get or set the log group retention policy. Ignoring the error and continuing.')
+          
               # Create the new lambda.
-              l = boto3.client('lambda', region_name=dest_region_name)    
+              l = boto3.client('lambda', region_name=dest_region_name)
               try:
                   resp = l.create_function(FunctionName=dest_names['lambda_name'], Runtime='python3.12', Role=os.environ['ALARM_LAMBDA_ROLE'], Handler='handler',
-                                          Code={'ZipFile': get_alarm_handler_lambda_code()}, Timeout=5, 
-                                          Environment={'Variables': {'SNS_TOPIC': os.environ['SNS_TOPIC'], 'S3_BUCKET': dest_names['bucket_arn']}})
-                  print(f'Expanding to a new region: Created a new lambda {dest_names['lambda_name']} in region {dest_region_name}')
+                                           Code={'ZipFile': get_alarm_handler_lambda_code()}, Timeout=5, DeadLetterConfig={'TargetArn': os.environ['SNS_TOPIC']},
+                                           LoggingConfig={'LogGroup': lgn},
+                                           Environment={'Variables': {'SNS_TOPIC': os.environ['SNS_TOPIC'], 'S3_BUCKET': dest_names['bucket_arn']}})
+                  logger.info(f'Expanding to a new region: Created a new lambda {dest_names['lambda_name']} in region {dest_region_name}')
                   return resp['FunctionArn']
               except botocore.exceptions.ClientError as e:
                   # It's remotely possible a different lambda run beat us to this part - if so just get the (new) ARN.
@@ -712,31 +814,62 @@ Resources:
                       # Retry the fetch. 
                       resp = l.get_function(FunctionName=dest_names['lambda_name'])
                       return resp['Configuration']['FunctionArn']
-
-
+          
+          
+          def region_destroy(region_name: str) -> None:
+              """
+              Destroy everything in a region that was built by region_build.
+          
+              :param region_name:
+              :return: None
+              """
+              # Lambda first.
+              names = get_alarm_names(region_name)
+              l = boto3.client('lambda', region_name=region_name)
+              try:
+                  l.delete_function(FunctionName=names['lambda_name'])
+                  logger.info(f"Purge: Region {region_name}: Removed lambda {names['lambda_name']}")
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] != 'ResourceNotFoundException':
+                      raise e
+          
+              # S3 bucket and its contents next.
+              s3 = boto3.resource('s3')
+              try:
+                  bucket = s3.Bucket(names['bucket_name'])
+                  bucket.objects.all().delete()
+                  bucket.delete()
+                  logger.info(f"Purge: Region {region_name}: Removed S3 bucket {names['bucket_name']}")
+              except botocore.exceptions.ClientError as e:
+                  if e.response['Error']['Code'] != 'NoSuchBucket':
+                      raise e
+          
+              # We deliberately leave the log group.
+          
+          
           def remove_alarm(region_name: str, alarm_name: str) -> None:
               """
               Deletes an alarm we created.
               :param str region_name: Region of the CloudWatch instance with the alarm
               :param str alarm_name: Alarm name
               """
-              cw = boto3.client('cloudwatch')
+              cw = boto3.client('cloudwatch', region_name=region_name)
               # Make sure to set the alarm state to OK (which will trigger the OKAction if necessary) before deleting the alarm
               cw.set_alarm_state(AlarmName=alarm_name, StateValue='OK', StateReason="Alarm is being removed.")
               cw.delete_alarms(AlarmNames=[alarm_name])
-
-
+          
+          
           def do_resync():
               """
               Resync the state between alarms created in CloudWatch, and the attachments actually present. Handles new attachments and attachments that have been deleted.
               Also handles if environment parameters for the alarms (THRESHOLD, MINIMUM_VALUE, MINUTES) have been changed and updates the alarms to match.
               """
-              # Gather our current state. This also removes any bad alarms.
+              # Gather our current state. This also removes any bad alarms that are still present for attachments that are not.
               ad = find_alarms(find_attachments())
-
+          
               # What the alarm settings should be
               settings = {'MINIMUM_VALUE': int(os.environ['MINIMUM_VALUE']), 'STDDEV': int(os.environ['STDDEV']), 'MINUTES': int(os.environ['MINUTES'])}
-
+          
               # Set all alarms that need to be set.
               for type, type_data in ad.items():
                   for region, region_data in type_data.items():
@@ -744,17 +877,19 @@ Resources:
                           for attachment_id, attach_data in attachments.items():
                               for metric_name in os.environ['METRIC_NAMES'].split(','):
                                   if attach_data['alarms'][metric_name]['present'] is False:
-                                      print(f"Missing alarm for {region} attachment {attachment_id} metric {metric_name} - creating it.")
+                                      logger.info(f"Missing alarm for {region} attachment {attachment_id} metric {metric_name} - creating it.")
                                       set_alarm(type, region, net_id, attachment_id, metric_name)
                                   elif attach_data['alarms'][metric_name]['settings'] != settings:
-                                      print(f"Settings have changed for alarm {attach_data['alarms'][metric_name]['name']} - current settings are {attach_data['alarms'][metric_name]['settings']}, new settings are {settings}. Rebuilding the alarm.")
+                                      logger.info(f"Settings have changed for alarm {attach_data['alarms'][metric_name]['name']} - current settings are {attach_data['alarms'][metric_name]['settings']}, new settings are {settings}. Rebuilding the alarm.")
                                       remove_alarm(attach_data['alarms'][metric_name]['region'], attach_data['alarms'][metric_name]['name'])
                                       set_alarm(type, region, net_id, attachment_id, metric_name)
-
-
+                                  else:
+                                      logger.debug(f"Region {region}, type {type}, attachment {attachment_id}: Alarm {attach_data['alarms'][metric_name]['name']} is correct.")
+          
+          
           def do_purge():
               """
-              Purge everything we've created as part of this script (all alarms, lambda and S3 buckets in other regions).
+              Purge everything we've created as part of this.
               """
               # Delete all alarms.
               regions:set[str] = set()
@@ -769,33 +904,16 @@ Resources:
                                   if ad[type][region][net_id][attachment_id]['alarms'][metric_name] is True:
                                       alarm_name = f'{metric_name}-{type}-{attachment_id}-{os.environ['OBJECTS_NAME']}-Alarm'
                                       remove_alarm(region, alarm_name)
-
+          
               # Delete the lambdas and buckets from all regions except ours (CloudFormation will handle that). 
               # We wrap this in try blocks as in case of aborted deployments or running at the same time, we could have already deleted these.
-              regions.discard(os.environ['AWS_REGION'])
-              for region_name in regions:
-                  # Lambda first.
-                  names = get_alarm_names(region_name)
-                  l = boto3.client('lambda', region_name=region_name)
-                  try:
-                      l.delete_function(FunctionName=names['lambda_name'])
-                      print(f"Purge: Region {region_name}: Removed lambda {names['lambda_name']}")
-                  except botocore.exceptions.ClientError as e:
-                      if e.response['Error']['Code'] != 'ResourceNotFoundException':
-                          raise e
-
-                  # S3 bucket and its contents next.
-                  s3 = boto3.resource('s3')
-                  try:
-                      bucket = s3.Bucket(names['bucket_name'])
-                      bucket.objects.all().delete()
-                      bucket.delete()
-                      print(f"Purge: Region {region_name}: Removed S3 bucket {names['bucket_name']}")
-                  except botocore.exceptions.ClientError as e:
-                      if e.response['Error']['Code'] != 'NoSuchBucket':
-                          raise e
-
-
+              if os.environ['MODE'] == 'nm':
+                  regions.discard(os.environ['AWS_REGION'])
+                  for region_name in regions:
+                      region_destroy(region_name)
+          
+          
+          
           def process_nm(event, context):
               """
               Process a notification from Network Manager. This event can be a few different types, and can be in any region, so this function needs to handle all
@@ -821,25 +939,25 @@ Resources:
                       if 'edgeLocation' in event['detail']:
                           for metric in os.environ['METRIC_NAMES']:
                               delete_alarm(type='cwan', region=event['detail']['edgeLocation'], metric_name=metric,
-                                          attachment_id=event['detail']['attachmentArn'].split('/')[1])
+                                           attachment_id=event['detail']['attachmentArn'].split('/')[1])
                       else:
                           for metric in os.environ['METRIC_NAMES']:
                               delete_alarm(type='tgw', region=event['detail']['region'], metric_name=metric,
-                                          attachment_id=event['detail']['transit-gateway-attachment-arn'].split('/')[1])
+                                           attachment_id=event['detail']['transit-gateway-attachment-arn'].split('/')[1])
                   case 'TGW-DELETED' | 'TGW-CREATED':
                       # Rethink the world.
                       do_resync()
                   case _:
                       # Ignore the other types (things like peering connections, etc)
                       pass
-
-
+          
+          
           def process_timer(event, context):
               # The timer fires off every so often (configurable) just to make sure some events didn't get missed. 
               # Do a resync to accomplish this.
               do_resync()
-
-
+          
+          
           def process_cloudformation(event, context):
               # If a CREATE, we need to do a resync which will catch every attachment that may have been missed.
               # If an UPDATE, we do a resync as well, which will correct any changes to settings of the alarms.
@@ -851,37 +969,47 @@ Resources:
               elif event['RequestType'] == 'Update':
                   do_resync()
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Data": "Successful"})
-
-
+          
+          
           def handler(event: Dict[str, Any], context):
               timer = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5, timeout, args=[event, context])
               timer.start()
-
+          
+              global CONTEXT_ACCOUNT_ID
+          
               try:
-                  # Are we being called with a EventManager notification from Network Manager
+                  CONTEXT_ACCOUNT_ID = context.invoked_function_arn.split(':')[4]
+          
+                  if 'DEBUG' in event:
+                      logger.setLevel(logging.DEBUG)
+                      logger.debug(f"Debug mode active. Event: {event}. Environment: {os.environ}")
+                  # Are we being called with a EventManager notification from Network Manager (this will only happen on CWAN type deployments)
                   if 'source' in event and event['source'] == 'aws.networkmanager':
-                      print(f"Processing Network Manager event, event data: {event}")
+                      logger.info(f"Processing Network Manager event, event data: {event}")
                       process_nm(event, context)
                   # Are we being called by EventManager from our timer?
                   elif 'source' in event and event['source'] == 'aws.events':
-                      print(f"Processing Event Bridge timer event, event data: {event}")
+                      logger.info(f"Processing Event Bridge timer event, event data: {event}")
                       process_timer(event, context)
                   # Are we being called from CloudFormation as part of initial install, update, or delete?
                   elif 'StackId' in event:
-                      print(f"Processing CloudFormation event, event data: {event}")
+                      logger.info(f"Processing CloudFormation event, event data: {event}")
                       process_cloudformation(event, context)
+                  elif 'TEST' in event:
+                      logger.info(f"Processing manual test request: {event}")
+                      do_resync()
                   else:
                       # Likely testing but didn't give correct parameters.
-                      print(f"Lambda function called but event does not contain EventManager or CloudFormation data. Aborting.")
+                      logger.error(f"Lambda function called but event does not contain NetworkManager, EventBridge, or CloudFormation data. If you want to do a manual resync, pass a variable 'TEST' with any value. Aborting.")
                   return
-
+          
               except Exception as e:
-                  logging.error('Exception: %s' % e, exc_info=True)
-                  logging.error(f"Data from request:\nevent={event}\ncontext={context}")
-
+                  logger.error('Exception: %s' % e, exc_info=True)
+                  logger.error(f"Data from request:\nevent={event}\ncontext={context}")
+          
                   if 'ResponseURL' in event:
                       cfnresponse.send(event, context, cfnresponse.FAILED, {"e": f'{e}'}, reason=f'{e}')
-
+          
                   # Do a best effort notification of the exception
                   sns = boto3.client('sns')
                   sns.publish(TopicArn=os.environ['SNS_TOPIC'], Subject=f'Lambda {os.environ['AWS_LAMBDA_FUNCTION_NAME']} in {os.environ['AWS_REGION']} had an exception.',
@@ -907,7 +1035,16 @@ Resources:
       Name: !Sub ${AWS::StackName}-ResyncEvents
       ScheduleExpression: 'rate(60 minutes)'
       Targets:
-        [{"Id": "1", "Arn": !GetAtt EventHandlerLambda.Arn}]      
+        - Id: 1
+          Arn: !GetAtt EventHandlerLambda.Arn
+
+  EventHandlerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventHandlerLambda
+      Action: lambda:InvokeFunction
+      Principal: "events.amazonaws.com"
+      SourceAccount: !Sub ${AWS::AccountId}
 
   AlarmPermission:
     Type: AWS::Lambda::Permission
@@ -924,11 +1061,6 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowSNSPublish
-            Effect: Allow
-            Action:
-              - "sns:Publish"
-            Resource: !If [MakeSNSTopic,!Ref SNSTopic,!Ref ExistingSNSTopic]
           - Sid: GetCWData
             Effect: Allow
             Action:
@@ -943,15 +1075,6 @@ Resources:
               - "ec2:DeleteFlowLogs"
               - "ec2:CreateTags"
               - "logs:CreateLogDelivery"
-          - !If
-            - MakeSNSTopic
-            - Sid: AllowKMSKeyUse
-              Effect: Allow
-              Action:
-                - "kms:GenerateDataKey"
-                - "kms:Decrypt"
-              Resource: !GetAtt SNSEncryptionKey.Arn
-            - !Ref "AWS::NoValue"
 
   AlarmRole:
     Type: AWS::IAM::Role
@@ -966,6 +1089,7 @@ Resources:
       Path: "/"
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Ref LambdaCommonPolicy
         - !Ref AlarmIAMPolicy
 
   AlarmLambda:
@@ -973,6 +1097,8 @@ Resources:
     Properties:
       DeadLetterConfig:
         TargetArn: !If [ MakeSNSTopic, !Ref SNSTopic, !Ref ExistingSNSTopic ]
+      LoggingConfig:
+        LogGroup: !Ref SharedLambdaLogGroup
       Handler: index.handler
       Role: !GetAtt AlarmRole.Arn
       Runtime: python3.12

@@ -409,7 +409,7 @@ def remove_alarm(region_name: str, alarm_name: str) -> None:
     :param str region_name: Region of the CloudWatch instance with the alarm
     :param str alarm_name: Alarm name
     """
-    cw = boto3.client('cloudwatch')
+    cw = boto3.client('cloudwatch', region_name=region_name)
     # Make sure to set the alarm state to OK (which will trigger the OKAction if necessary) before deleting the alarm
     cw.set_alarm_state(AlarmName=alarm_name, StateValue='OK', StateReason="Alarm is being removed.")
     cw.delete_alarms(AlarmNames=[alarm_name])
@@ -443,7 +443,7 @@ def do_resync():
 
 def do_purge():
     """
-    Purge everything we've created as part of this script (all alarms, lambda and S3 buckets in other regions).
+    Purge everything we've created as part of this.
     """
     # Delete all alarms.
     regions:set[str] = set()
